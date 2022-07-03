@@ -29,6 +29,9 @@
 #![deny(rustdoc::missing_crate_level_docs)]
 // Allow things I can't fix
 #![allow(clippy::multiple_crate_versions)]
+// The "const fn" lint is garbage rn and does not
+// handle destructors well at all
+#![allow(clippy::missing_const_for_fn)]
 
 
 use tracing::{
@@ -39,11 +42,13 @@ use tracing::{
 };
 use tokio::{
     sync::{
+        broadcast,
         mpsc
     }
 };
 
 mod api;
+mod dto;
 mod errors;
 mod manager;
 mod messages;
@@ -71,20 +76,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Some queues we need
     let (req_tx, req_rx) = mpsc::channel(64);
     let (poll_tx, poll_rx) = mpsc::channel(64);
+    let (shut_tx, shut_rx) = broadcast::channel(1);
 
     // Manager thread
     let manager_handle = tokio::spawn(async move {
         manager::manager(
             req_rx,
-            poll_rx
+            poll_rx,
+            shut_rx
         ).await
     });
 
     // Web API
+    let shut_rx = shut_tx.subscribe();
     let api_handle = tokio::spawn(async move {
         api::start_api(
             req_tx,
-            poll_tx
+            poll_tx,
+            shut_rx
         ).await
     });
 
@@ -96,13 +105,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     info!("Shutting down");
 
-    // Shut down the API first
-    api_handle.abort();
+    // Shut down
+    std::mem::drop(shut_tx.send(()));
     std::mem::drop(api_handle.await);
     info!("Web API terminated");
 
     // Shut down the manager
-    manager_handle.abort();
     std::mem::drop(manager_handle.await);
     info!("Manager terminated");
 

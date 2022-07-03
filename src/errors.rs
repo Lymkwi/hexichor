@@ -25,9 +25,15 @@ pub struct SyncError<E> {
     err: E
 }
 
-impl<E: std::error::Error> SyncError<E> {
+impl<E: std::error::Error + Send + Sync + 'static + Sized> SyncError<E> {
     pub const fn from(err: E) -> Self {
         Self { err }
+    }
+}
+
+impl<E: std::error::Error + Send + Sync + 'static + std::fmt::Debug> SyncError<E> {
+    pub fn get_error(&self) -> &E {
+        &self.err
     }
 }
 

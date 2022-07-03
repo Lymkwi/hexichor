@@ -6,15 +6,14 @@ use reqwest::Url;
 use tracing::{
     info,
     debug,
-    trace,
     warn,
-    error
 };
 use tokio::sync::{
+    broadcast,
     mpsc,
     oneshot,
-    Mutex
 };
+use uuid::Uuid;
 use warp::{
     filters::body::BodyDeserializeError,
     reject,
@@ -27,11 +26,13 @@ use warp::{
 
 use std::{
     convert::Infallible,
-    net::IpAddr,
-    sync::Arc
+    net::IpAddr
 };
 
 use crate::{
+    dto::{
+        StatusReply
+    },
     errors::{
         EmptyRequest,
         InvalidUrl,
@@ -83,13 +84,38 @@ async fn request_inspection(
 
     let new_uuid = ret_rx.await
         .map_err(|e| reject::custom(
-                SyncError::from(e)
+            SyncError::from(e)
         ))?;
-
     Ok(reply::with_status(
         new_uuid.to_string(),
         StatusCode::OK
     ))
+}
+
+#[tracing::instrument(level="debug")]
+async fn request_status(
+    uuid: Uuid,
+    status_tx: mpsc::Sender<StatusRequestMessage>
+) -> Result<impl warp::Reply, warp::Rejection> {
+    // Status request
+    let (o_tx, o_rx) = oneshot::channel();
+    let req = (uuid, o_tx);
+    status_tx.send(req).await
+        .map_err(SyncError::from)?;
+    match o_rx.await.map_err(SyncError::from)? {
+        Some(result) => Ok({
+            reply::json(& StatusReply::new(
+                    result.is_finished(),
+                    result.into_results()
+                        .into_iter()
+                        .map(|(k,v)| {
+                            (k.to_string(), i32::from(v))
+                        })
+                        .collect()
+            ))
+        }),
+        None => Err(reject::reject())
+    }
 }
 
 #[tracing::instrument(level="debug")]
@@ -103,7 +129,7 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
     } else if let Some(e) = err.find::<BodyDeserializeError>() {
         Ok(reply::with_status(format!("Deserialize error : {}", e), StatusCode::BAD_REQUEST))
     } else if let Some(e) = err.find::<SyncError<oneshot::error::RecvError>>() {
-        Ok(reply::with_status(format!("Synchronization error : {:?}", e), StatusCode::INTERNAL_SERVER_ERROR))
+        Ok(reply::with_status(format!("Synchronization error : {:?}", e.get_error()), StatusCode::INTERNAL_SERVER_ERROR))
     } else {
         warn!("Unhandled rejection: {:?}", err);
         Ok(reply::with_status("INTERNAL_SERVER_ERROR".into(), StatusCode::INTERNAL_SERVER_ERROR))
@@ -113,11 +139,12 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
 #[tracing::instrument(level="debug")]
 pub async fn start_api(
     manager_req_tx: mpsc::Sender<RequestMessage>,
-    manager_poll_tx: mpsc::Sender<StatusRequestMessage>
+    manager_poll_tx: mpsc::Sender<StatusRequestMessage>,
+    mut shut_rx: broadcast::Receiver<()>
 ) -> Result<(), Box<dyn std::error::Error + Send>> {
     // Turn the queues into filters
     let manager_req_tx = warp::any().map(move || manager_req_tx.clone());
-    let _manager_poll_tx = warp::any().map(move || manager_poll_tx.clone());
+    let manager_poll_tx = warp::any().map(move || manager_poll_tx.clone());
     debug!("Composing API");
 
     let healthcheck = warp::path!("healthcheck")
@@ -128,9 +155,16 @@ pub async fn start_api(
         .and(manager_req_tx.clone())
         .and(warp::body::json())
         .and_then(request_inspection);
+    debug!("Registered /request/new route");
+
+    let status_request = warp::path!("request" / Uuid)
+        .and(manager_poll_tx.clone())
+        .and_then(request_status);
+    debug!("Registered /request/<uuid>");
 
     let routes = healthcheck
         .or(new_request)
+        .or(status_request)
         .recover(handle_rejection);
 
     let ip = std::env::var("IP")
@@ -143,6 +177,10 @@ pub async fn start_api(
         .unwrap_or(3008);
 
     info!("Launching at {}:{}", ip, port);
-    warp::serve(routes).run((ip, port)).await;
+    warp::serve(routes)
+        .bind_with_graceful_shutdown((ip, port), async move {
+            shut_rx.recv().await.expect("Terminated badly");
+        }).1.await;
+    info!("Web API shut down");
     Ok(())
 }
