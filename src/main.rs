@@ -48,6 +48,7 @@ use tokio::{
 };
 
 mod api;
+mod auth;
 mod dto;
 mod errors;
 mod manager;
@@ -97,11 +98,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ).await
     });
 
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => {},
-        Err(err) => {
-            error!("Unable to listen to ^C signal: {}", err);
-        }
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        error!("Unable to listen to ^C signal: {}", err);
     }
     info!("Shutting down");
 

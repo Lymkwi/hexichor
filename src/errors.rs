@@ -38,3 +38,8 @@ impl<E: std::error::Error + Send + Sync + 'static + std::fmt::Debug> SyncError<E
 }
 
 impl<E: std::error::Error + Send + Sync + 'static> reject::Reject for SyncError<E> {}
+
+#[derive(Debug)]
+pub struct Unauthorized;
+
+impl reject::Reject for Unauthorized {}

@@ -12,13 +12,17 @@ use tokio::sync::{
     broadcast,
     mpsc,
     oneshot,
+    Mutex
 };
 use uuid::Uuid;
 use warp::{
     filters::body::BodyDeserializeError,
     reject,
     reply,
-    http::StatusCode,
+    http::{
+        Response,
+        StatusCode
+    },
     Filter,
     Rejection,
     Reply
@@ -26,17 +30,21 @@ use warp::{
 
 use std::{
     convert::Infallible,
-    net::IpAddr
+    net::IpAddr,
+    sync::Arc
 };
 
 use crate::{
+    auth::Engine,
     dto::{
-        StatusReply
+        StatusReply,
+        LoginRequest
     },
     errors::{
         EmptyRequest,
         InvalidUrl,
-        SyncError
+        SyncError,
+        Unauthorized
     },
     messages::{
         RequestMessage,
@@ -114,7 +122,58 @@ async fn request_status(
                         .collect()
             ))
         }),
-        None => Err(reject::reject())
+        None => {
+            warn!("Request missing UUID={}", uuid);
+            Err(reject::reject())
+        }
+    }
+}
+
+fn check_authentication<E: Filter<Extract=(Arc<Mutex<Engine>>,), Error=Infallible> + Clone + Send + Sync>(
+auth_engine: E
+) -> impl Filter<Extract=((),), Error=Rejection> + Clone {
+    warp::filters::cookie::optional::<String>("HEX")
+        .and(auth_engine)
+        .and_then(cookie_checker)
+        //.map(|a: String, b: Arc<Mutex<Engine>>| {}) //cookie_checker)
+}
+
+async fn cookie_checker(
+    cookie: Option<String>,
+    engine: Arc<Mutex<Engine>>
+) -> Result<(), Rejection> {
+    let engine = engine.lock().await;
+    cookie.map_or_else(|| Err(warp::reject::custom(Unauthorized)),
+        |cook| if engine.is_authorized(&cook) {
+            Ok(())
+        } else {
+            Err(warp::reject::custom(Unauthorized))        
+    })
+}
+
+#[tracing::instrument(level="debug", skip(auth_engine, body))]
+async fn authentication_request(
+    auth_engine: Arc<Mutex<Engine>>,
+    body: LoginRequest
+) -> Result<impl warp::Reply, warp::Rejection> {
+    // Try and get the login
+    let mut engine = auth_engine.lock().await;
+    // Try and authenticate
+    match engine.verify(body.get_user(), body.get_password().as_bytes()) {
+        None => {
+            debug!("Failed authentication");
+            Ok(Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .body("UNAUTHORIZED")
+        )},
+        Some(cookie) => {
+            info!("Successful authentication of user {}", body.get_user());
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("set-cookie", format!("HEX={}", cookie))
+                .body("OK")
+            )
+        }
     }
 }
 
@@ -130,6 +189,8 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
         Ok(reply::with_status(format!("Deserialize error : {}", e), StatusCode::BAD_REQUEST))
     } else if let Some(e) = err.find::<SyncError<oneshot::error::RecvError>>() {
         Ok(reply::with_status(format!("Synchronization error : {:?}", e.get_error()), StatusCode::INTERNAL_SERVER_ERROR))
+    } else if err.find::<Unauthorized>().is_some() {
+        Ok(reply::with_status("UNAUTHORIZED".into(), StatusCode::UNAUTHORIZED))
     } else {
         warn!("Unhandled rejection: {:?}", err);
         Ok(reply::with_status("INTERNAL_SERVER_ERROR".into(), StatusCode::INTERNAL_SERVER_ERROR))
@@ -142,6 +203,9 @@ pub async fn start_api(
     manager_poll_tx: mpsc::Sender<StatusRequestMessage>,
     mut shut_rx: broadcast::Receiver<()>
 ) -> Result<(), Box<dyn std::error::Error + Send>> {
+    // Authentication engine
+    let auth_engine = Arc::new(Mutex::new(Engine::new("/")));
+    let auth_engine = warp::any().map(move || Arc::clone(&auth_engine));
     // Turn the queues into filters
     let manager_req_tx = warp::any().map(move || manager_req_tx.clone());
     let manager_poll_tx = warp::any().map(move || manager_poll_tx.clone());
@@ -152,19 +216,34 @@ pub async fn start_api(
     debug!("Registered /healthcheck route");
 
     let new_request = warp::path!("request" / "new")
+        .and(check_authentication(auth_engine.clone()))
+        .untuple_one()
         .and(manager_req_tx.clone())
         .and(warp::body::json())
         .and_then(request_inspection);
     debug!("Registered /request/new route");
 
-    let status_request = warp::path!("request" / Uuid)
+    let status_request = warp::path("request")
+        .and(check_authentication(auth_engine.clone()))
+        .untuple_one()
+        // Path param is moved into its own filter so that
+        // it is not passed to `check_authentication`
+        .and(warp::path::param())
         .and(manager_poll_tx.clone())
         .and_then(request_status);
     debug!("Registered /request/<uuid>");
 
+    let login = warp::path!("login")
+        .and(warp::filters::method::post())
+        .and(auth_engine.clone())
+        .and(warp::body::json())
+        .and_then(authentication_request);
+    debug!("Registered /login");
+
     let routes = healthcheck
         .or(new_request)
         .or(status_request)
+        .or(login)
         .recover(handle_rejection);
 
     let ip = std::env::var("IP")

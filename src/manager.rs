@@ -163,11 +163,8 @@ pub async fn manager(
                 // Explode the request
                 let (urls, ret_tx) = reqmsg.explode();
                 // Register the request and respond
-                match ret_tx.send(data.register(urls).await) {
-                    Ok(()) => { /* all went ok */ }
-                    Err(_) => {
-                        error!("Unable to send back addition result");
-                    }
+                if ret_tx.send(data.register(urls).await).is_err() {
+                    error!("Unable to send back addition result");
                 }
             }
             Some(statusreqmsg) = poll_rx.recv() => {
