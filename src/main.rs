@@ -74,6 +74,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     create_subscriber()?;
     debug!("Logger initialized");
 
+    run_server().await
+}
+
+
+async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     // Some queues we need
     let (req_tx, req_rx) = mpsc::channel(64);
     let (poll_tx, poll_rx) = mpsc::channel(64);
@@ -88,18 +93,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ).await
     });
 
+    // Use the broadcast channel to get shut down by API on failure
+    let mut shut_ourselves = shut_tx.subscribe();
+
     // Web API
     let shut_rx = shut_tx.subscribe();
+    let shut_inx = shut_tx.clone();
     let api_handle = tokio::spawn(async move {
-        api::start_api(
-            req_tx,
-            poll_tx,
-            shut_rx
-        ).await
+        if api::start_api(
+                req_tx,
+                poll_tx,
+                shut_rx
+                ).await.is_err() {
+            error!("Signaling shutdown");
+            shut_inx.send(())
+                .expect("API could not start, but we are unable to signal for shutdown. Panicking.");
+        }
     });
 
-    if let Err(err) = tokio::signal::ctrl_c().await {
-        error!("Unable to listen to ^C signal: {}", err);
+    tokio::select! {
+        a = tokio::signal::ctrl_c() => {
+            if let Err(err) = a {
+                error!("Unable to listen to ^C signal: {}", err);    
+            }
+        }
+        _ = shut_ourselves.recv() => {
+            // Shutting down
+        }
+        else => {
+            info!("Unhandled");
+        }
     }
     info!("Shutting down");
 

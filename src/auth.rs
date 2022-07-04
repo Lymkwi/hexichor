@@ -8,10 +8,17 @@ use rand::{
     distributions::Alphanumeric,
     Rng
 };
+use serde::{
+    Deserialize,
+    Serialize
+};
 
 use std::{
     collections::HashMap,
-    path::Path
+    path::{
+        Path,
+        PathBuf    
+    }
 };
 
 pub struct Engine {
@@ -19,18 +26,29 @@ pub struct Engine {
     allowed: Vec<String>
 }
 
+#[derive(Default, Deserialize, Serialize)]
+struct FileFormat {
+    credentials: HashMap<String, String>
+}
+
 impl Engine {
-    pub fn new<A: AsRef<Path>>(_path: A) -> Self {
-        // TODO: load shit from the file
-        //let salt = b"et oui Jamy c'est ici que l'on recolte la moitie du sel rustaceen";
-        //let password = "🅱assword";
-        //let config = Config::default();
-        let users = HashMap::new();
-        //users.insert("a_user".into(), argon2::hash_encoded(password.as_bytes(), salt, &config).unwrap());
-        Self {
-            users,
-            allowed: Vec::new()
+    pub fn new(path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let bpath: PathBuf = PathBuf::from(path);
+        // If the file does not exist..
+        if !bpath.exists() {
+            // Try and create the file
+            let file = std::fs::File::create(path)?;
+            serde_yaml::to_writer(file, &FileFormat::default())?;
         }
+        // Read from the file
+        let data_bytes: Vec<u8> = std::fs::read(path)?;
+        let data_string: String = String::from_utf8(data_bytes)?;
+        let users_file: FileFormat = serde_yaml::from_str(&data_string)?;
+        //users.insert("a_user".into(), argon2::hash_encoded(password.as_bytes(), salt, &config).unwrap());
+        Ok(Self {
+            users: users_file.credentials,
+            allowed: Vec::new()
+        })
     }
 
     pub fn is_authorized(&self, cookie: &String) -> bool {

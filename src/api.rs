@@ -4,8 +4,9 @@
 #[allow(unused_imports)]
 use reqwest::Url;
 use tracing::{
-    info,
     debug,
+    error,
+    info,
     warn,
 };
 use tokio::sync::{
@@ -202,9 +203,14 @@ pub async fn start_api(
     manager_req_tx: mpsc::Sender<RequestMessage>,
     manager_poll_tx: mpsc::Sender<StatusRequestMessage>,
     mut shut_rx: broadcast::Receiver<()>
-) -> Result<(), Box<dyn std::error::Error + Send>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Authentication engine
-    let auth_engine = Arc::new(Mutex::new(Engine::new("/")));
+    let auth_engine = Engine::new("creds.yaml")
+        .map_err(|e| {
+            error!("Unable to start API auth engine! {}", e);
+            e
+        })?;
+    let auth_engine = Arc::new(Mutex::new(auth_engine));
     let auth_engine = warp::any().map(move || Arc::clone(&auth_engine));
     // Turn the queues into filters
     let manager_req_tx = warp::any().map(move || manager_req_tx.clone());
